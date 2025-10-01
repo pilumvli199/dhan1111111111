@@ -1,238 +1,228 @@
-#!/usr/bin/env python3
-# main.py — simplified runner (no telegram.ext Application/updater)
-# - Uses Bot.send_message for Telegram
-# - Avoids python-telegram-bot Application/Updater incompatibility
-# - Tries to use dhanhq client if available, else falls back to a requests placeholder
-# - Periodically fetches LTP and sends option-chain snapshot
-
 import os
 import asyncio
 import json
-import signal
-import logging
 from datetime import datetime
-
+from dhanhq import dhanhq
 import requests
-
-# Try import dhanhq client (optional). If not present, we'll use HTTP fallback.
-try:
-    from dhanhq import dhanhq, marketfeed  # type: ignore
-    _HAS_DHANHQ = True
-except Exception:
-    _HAS_DHANHQ = False
-
-# telegram Bot (async)
 from telegram import Bot
+from telegram.ext import Application, CommandHandler
+import logging
 
-# Logging
+# Logging setup
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=os.getenv("LOG_LEVEL", "INFO").upper()
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=getattr(logging, LOG_LEVEL, logging.INFO)
 )
 logger = logging.getLogger(__name__)
 
-# ENV
-DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID", "").strip()
-DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Environment variables
+DHAN_CLIENT_ID = os.getenv("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.getenv("DHAN_ACCESS_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
-STRIKE_WINDOW = int(os.getenv("STRIKE_WINDOW", "5"))   # +/- strikes to show
-OPTION_EXPIRY_NIFTY = os.getenv("OPTION_EXPIRY_NIFTY", "2025-10-03")
-OPTION_EXPIRY_TCS = os.getenv("OPTION_EXPIRY_TCS", "2025-10-03")
+# Initialize DhanHQ
+dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+logger.info("Initialized dhanhq client.")
 
-# Instruments - placeholders (replace with actual security ids from Dhan docs)
+# Instrument tokens (update with actual tokens from DhanHQ docs)
 INSTRUMENTS = {
-    "NIFTY50": {"security_id": os.getenv("NIFTY_SECURITY_ID", "13"), "exchange": os.getenv("NIFTY_EXCHANGE","IDX_I")},
-    "TCS": {"security_id": os.getenv("TCS_SECURITY_ID", "11536"), "exchange": os.getenv("TCS_EXCHANGE","NSE_EQ")},
+    "NIFTY50": {"security_id": "13", "exchange": "IDX_I"},
+    "TCS": {"security_id": "11536", "exchange": "NSE_EQ"},
 }
-
-# Initialize dhanhq client if available
-if _HAS_DHANHQ and DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN:
-    try:
-        dhan = dhanhq(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)  # adjust constructor if package differs
-        logger.info("Initialized dhanhq client.")
-    except Exception as e:
-        logger.warning("Failed to initialize dhanhq client: %s", e)
-        dhan = None
-else:
-    dhan = None
-    if not _HAS_DHANHQ:
-        logger.info("dhanhq package not available; using HTTP fallback for market data (placeholder).")
-    else:
-        logger.info("DHAN credentials not provided; using HTTP fallback (placeholder).")
-
-# Telegram Bot
-if not TELEGRAM_BOT_TOKEN:
-    logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram sends will be skipped.")
-bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 class OptionChainBot:
     def __init__(self):
+        self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        self.latest_data = {}
         self.running = True
-        self.task = None
 
-    async def get_ltp(self, security_id: str, exchange: str):
+    async def get_ltp(self, security_id, exchange):
         """
-        Try dhanhq client first; if not available, use HTTP placeholder.
-        NOTE: Replace placeholder HTTP with real DhanHQ REST endpoint if available.
+        Robust debug-friendly get_ltp:
+        - logs raw response from dhanhq client (or fallback HTTP)
+        - tries multiple common JSON keys for LTP
         """
         try:
             if dhan:
-                # adapt to actual dhanhq method names/response
-                # Many dhanhq wrappers use something like dhan.get_market_quote(...)
-                resp = dhan.get_market_quote(security_id, exchange)
-                # resp shape may vary; try common keys
-                if resp and isinstance(resp, dict):
-                    data = resp.get("data") or resp.get("result") or resp
-                    if isinstance(data, dict):
-                        # common key names: LTP / ltp / lastPrice
-                        return data.get("LTP") or data.get("ltp") or data.get("lastPrice") or data.get("last_traded_price")
-                return None
-            else:
-                # Placeholder HTTP - user must change to real DhanHQ REST API if they want
-                # This will most likely NOT work until you replace with real endpoint.
-                if not DHAN_ACCESS_TOKEN:
+                try:
+                    resp = dhan.get_market_quote(security_id, exchange)
+                except Exception as e:
+                    logger.debug("dhan.get_market_quote raised: %s", e, exc_info=True)
+                    resp = None
+                logger.debug(
+                    "dhanhq raw response for %s@%s: %s",
+                    security_id,
+                    exchange,
+                    repr(resp)[:2000],
+                )
+                if not resp:
                     return None
-                url = f"https://api.dhan.co/market/quote?security_id={security_id}&exchange={exchange}"
-                headers = {"Authorization": f"Bearer {DHAN_ACCESS_TOKEN}"}
-                r = requests.get(url, headers=headers, timeout=10)
-                r.raise_for_status()
-                j = r.json()
-                data = j.get("data") or j
-                return data.get("LTP") or data.get("ltp") or data.get("lastPrice") or None
-        except Exception as e:
-            logger.debug("get_ltp failed for %s@%s: %s", security_id, exchange, e)
+                body = None
+                if isinstance(resp, dict):
+                    body = (
+                        resp.get("data")
+                        or resp.get("result")
+                        or resp.get("response")
+                        or resp
+                    )
+                else:
+                    body = resp
+                if isinstance(body, dict):
+                    for key in (
+                        "LTP",
+                        "ltp",
+                        "lastPrice",
+                        "last_traded_price",
+                        "lastTradedPrice",
+                    ):
+                        if key in body and body[key] not in (None, ""):
+                            try:
+                                return float(body[key])
+                            except:
+                                pass
+                    nested = body.get("quote") or body.get("market")
+                    if isinstance(nested, dict):
+                        for key in ("LTP", "ltp", "lastPrice", "last_traded_price"):
+                            if key in nested and nested[key] not in (None, ""):
+                                try:
+                                    return float(nested[key])
+                                except:
+                                    pass
+                return None
+
+            # Fallback HTTP
+            if not DHAN_ACCESS_TOKEN:
+                logger.debug("No DHAN_ACCESS_TOKEN for HTTP fallback.")
+                return None
+            url = f"https://api.dhan.co/market/quote?security_id={security_id}&exchange={exchange}"
+            headers = {
+                "Authorization": f"Bearer {DHAN_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            }
+            r = requests.get(url, headers=headers, timeout=12)
+            logger.debug("HTTP fallback status=%s body=%s", r.status_code, r.text[:2000])
+            r.raise_for_status()
+            j = r.json()
+            body = j.get("data") if isinstance(j, dict) else j
+            if isinstance(body, dict):
+                for key in ("LTP", "ltp", "lastPrice", "last_traded_price"):
+                    if key in body and body[key] not in (None, ""):
+                        try:
+                            return float(body[key])
+                        except:
+                            pass
+                nested = body.get("quote") or body.get("market") or body.get("result")
+                if isinstance(nested, dict):
+                    for key in ("LTP", "ltp", "lastPrice"):
+                        if key in nested and nested[key] not in (None, ""):
+                            try:
+                                return float(nested[key])
+                            except:
+                                pass
+            return None
+        except Exception as exc:
+            logger.exception(
+                "get_ltp unexpected error for %s@%s: %s", security_id, exchange, exc
+            )
             return None
 
-    def get_nearest_expiry(self, symbol: str):
-        # Very simple placeholder — replace with actual expiry resolution logic if you want
-        if symbol.upper().startswith("NIFTY"):
-            return OPTION_EXPIRY_NIFTY
-        return OPTION_EXPIRY_TCS
-
-    def get_option_data(self, symbol: str, strike: float, option_type: str, expiry: str):
-        """
-        Placeholder for option leg data. Replace with real option security-fetch logic.
-        At minimum, it should return a dict with ltp, oi, iv, volume keys.
-        """
-        # Users should replace this with proper mapping from strike -> option security id
-        return {"ltp": 0.0, "oi": 0, "iv": 0.0, "volume": 0}
-
-    def build_option_chain(self, symbol: str, spot_price: float):
+    def get_option_chain(self, symbol, spot_price):
         try:
-            # choose a sensible strike interval
-            strike_interval = 50 if symbol.upper().startswith("NIFTY") else 50
-            atm = round(spot_price / strike_interval) * strike_interval
+            strike_interval = 50
+            atm_strike = round(spot_price / strike_interval) * strike_interval
             expiry = self.get_nearest_expiry(symbol)
-            result = []
-            for i in range(-STRIKE_WINDOW*2, STRIKE_WINDOW*2 + 1):
-                strike = int(atm + i * strike_interval)
-                ce = self.get_option_data(symbol, strike, "CE", expiry)
-                pe = self.get_option_data(symbol, strike, "PE", expiry)
-                result.append({"strike": strike, "CE": ce, "PE": pe, "is_atm": (strike == atm)})
-            return result
+            option_data = []
+            for i in range(-5, 6):
+                strike = atm_strike + (i * strike_interval)
+                option_data.append(
+                    {
+                        "strike": strike,
+                        "CE": {"ltp": 0},
+                        "PE": {"ltp": 0},
+                        "is_atm": i == 0,
+                    }
+                )
+            return option_data
         except Exception as e:
-            logger.error("build_option_chain error: %s", e)
+            logger.error(f"Error fetching option chain: {e}")
             return []
 
-    def format_message(self, symbol: str, spot_price: float, chain):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def get_nearest_expiry(self, symbol):
+        return "2025-10-03"
+
+    def format_message(self, symbol, spot_price, option_chain):
         msg = f"🔔 *{symbol} Option Chain Update*\n"
         msg += f"📊 *Spot Price:* ₹{spot_price:.2f}\n"
-        msg += f"⏰ *Time:* {ts}\n"
+        msg += f"⏰ *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+
         msg += "```\n"
-        msg += f"{'Strike':>7} {'CE LTP':>10} {'PE LTP':>10}\n"
-        msg += "-"*35 + "\n"
-        for r in chain:
-            marker = "➤" if r.get("is_atm") else " "
-            ce_ltp = r["CE"].get("ltp", 0.0) if r.get("CE") else 0.0
-            pe_ltp = r["PE"].get("ltp", 0.0) if r.get("PE") else 0.0
-            msg += f"{marker}{int(r['strike']):7d} {float(ce_ltp):10.2f} {float(pe_ltp):10.2f}\n"
+        msg += f"{'Strike':<8} {'CE LTP':<10} {'PE LTP':<10}\n"
+        msg += "-" * 35 + "\n"
+
+        for opt in option_chain:
+            strike_marker = "➤" if opt["is_atm"] else " "
+            ce_ltp = opt["CE"]["ltp"] if opt["CE"] else 0
+            pe_ltp = opt["PE"]["ltp"] if opt["PE"] else 0
+            msg += f"{strike_marker}{opt['strike']:<7} {ce_ltp:<10.2f} {pe_ltp:<10.2f}\n"
+
         msg += "```\n"
         return msg
 
-    async def send_telegram(self, text: str):
-        if not bot:
-            logger.debug("No bot configured; skipping send.")
-            return
+    async def send_telegram_message(self, message):
         try:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True)
-            logger.info("Sent Telegram update.")
+            await self.telegram_bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown"
+            )
+            logger.info("Message sent to Telegram")
         except Exception as e:
-            logger.warning("Failed to send Telegram message: %s", e)
+            logger.error(f"Error sending Telegram message: {e}")
 
     async def process_and_send_data(self):
-        logger.info("Starting main poll loop (interval %ss)", POLL_INTERVAL)
         while self.running:
             try:
-                for symbol, cfg in INSTRUMENTS.items():
-                    sec_id = cfg.get("security_id")
-                    exch = cfg.get("exchange")
-                    ltp = await self.get_ltp(sec_id, exch)
-                    if ltp is None:
-                        logger.info("%s: no LTP this cycle (id=%s)", symbol, sec_id)
-                        continue
-                    logger.info("%s LTP: %s", symbol, ltp)
-                    chain = self.build_option_chain(symbol, float(ltp))
-                    msg = self.format_message(symbol, float(ltp), chain)
-                    await self.send_telegram(msg)
-                # jitter small random to avoid strict schedule collisions
-                await asyncio.sleep(POLL_INTERVAL + (0.1 * (random_jitter())))
-            except asyncio.CancelledError:
-                logger.info("process_and_send_data cancelled, exiting loop.")
-                break
+                for symbol, details in INSTRUMENTS.items():
+                    ltp = await self.get_ltp(details["security_id"], details["exchange"])
+                    if ltp:
+                        logger.info(f"{symbol} LTP: {ltp}")
+                        option_chain = self.get_option_chain(symbol, ltp)
+                        message = self.format_message(symbol, ltp, option_chain)
+                        await self.send_telegram_message(message)
+                    else:
+                        logger.warning(f"{symbol}: no LTP this cycle (id={details['security_id']})")
+                await asyncio.sleep(60)
             except Exception as e:
-                logger.exception("Error in process loop: %s", e)
-                # wait a bit before next attempt
-                await asyncio.sleep(min(60, POLL_INTERVAL))
+                logger.error(f"Error in main loop: {e}")
+                await asyncio.sleep(10)
 
-    async def start(self):
-        self.task = asyncio.create_task(self.process_and_send_data())
+    async def start_command(self, update, context):
+        await update.message.reply_text("🚀 Bot Started!")
 
-    async def stop(self):
-        logger.info("Stopping bot...")
+    async def stop_command(self, update, context):
         self.running = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Stopped.")
+        await update.message.reply_text("⏹️ Bot stopped!")
 
-def random_jitter():
-    # small jitter in seconds (0..1)
-    return float(os.urandom(1)[0]) / 255.0
+    async def status_command(self, update, context):
+        status = "🟢 Running" if self.running else "🔴 Stopped"
+        await update.message.reply_text(f"Bot Status: {status}")
 
-# graceful shutdown
-def _install_signal_handlers(loop, bot_obj):
-    def _stop(sig):
-        logger.info("Received signal %s - shutting down...", sig.name)
-        asyncio.create_task(bot_obj.stop())
-    for s in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(s, lambda s=s: _stop(s))
-        except NotImplementedError:
-            # Windows or environments where signal handlers aren't supported
-            pass
+    async def run(self):
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", self.start_command))
+        app.add_handler(CommandHandler("stop", self.stop_command))
+        app.add_handler(CommandHandler("status", self.status_command))
+
+        await app.initialize()
+        await app.start()
+        logger.info("Bot started successfully!")
+        await self.process_and_send_data()
+        await app.stop()
 
 async def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram not fully configured (check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID). Bot will not send messages.")
-    ocb = OptionChainBot()
-    loop = asyncio.get_running_loop()
-    _install_signal_handlers(loop, ocb)
-    await ocb.start()
-    # wait until stopped
-    while ocb.running:
-        await asyncio.sleep(1)
-    logger.info("Main exiting.")
+    bot = OptionChainBot()
+    await bot.run()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt - exit")
+    asyncio.run(main())
